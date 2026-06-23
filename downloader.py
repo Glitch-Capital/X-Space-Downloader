@@ -110,6 +110,11 @@ def _resolve_audio_file(output_path: str) -> str:
     return str(p)  # return original path; transcribe_audio will report the error
 
 
+def _audio_exists(output_path: str) -> bool:
+    """Return True if any audio file for this stem already exists on disk."""
+    return _resolve_audio_file(output_path) != output_path or Path(output_path).exists()
+
+
 # ---------------------------------------------------------------------------
 # Primary method: yt-dlp
 # ---------------------------------------------------------------------------
@@ -236,13 +241,7 @@ def download_with_ffmpeg(hls_url: str, output_path: str) -> bool:
     return result.returncode == 0
 
 
-def download_via_guest_api(space_url: str, output_path: str) -> bool:
-    """
-    Fallback: resolve the HLS URL through the public guest-token API and
-    download it with ffmpeg (or yt-dlp if ffmpeg is unavailable).
-    Returns True on success.
-    """
-    space_id = extract_space_id(space_url)
+def _build_guest_session() -> requests.Session:
     session = requests.Session()
     session.headers.update(
         {
@@ -255,30 +254,88 @@ def download_via_guest_api(space_url: str, output_path: str) -> bool:
             "x-twitter-active-user": "yes",
         }
     )
-
-    print("[*] (Fallback) Obtaining guest token…")
     guest_token = _get_guest_token(session)
     session.headers["x-guest-token"] = guest_token
     session.headers.update(_bearer_header())
-    print("[*] Guest token acquired.")
+    return session
 
-    print("[*] (Fallback) Fetching space metadata…")
-    metadata = _get_space_metadata(session, space_id)
-    audio_space = metadata["data"]["audioSpace"]
-    media_key = audio_space["metadata"]["media_key"]
-    state = audio_space["metadata"]["state"]
-    print(f"[*] Media key  : {media_key}")
-    print(f"[*] Space state: {state}")
 
-    if state not in ("Ended", "TimedOut"):
-        print(
-            "[!] Space may still be live – replay might not be ready yet. "
-            "Re-run after the space ends if the download fails."
+def save_metadata(space_id: str, metadata_path: str) -> bool:
+    """
+    Fetch space metadata via the guest-token API and write a JSON sidecar to
+    *metadata_path*. Returns True on success.
+    """
+    try:
+        print("[*] Fetching space metadata for sidecar…")
+        session = _build_guest_session()
+        raw = _get_space_metadata(session, space_id)
+        audio_space = raw["data"]["audioSpace"]["metadata"]
+
+        sidecar = {
+            "space_id": space_id,
+            "title": audio_space.get("title", ""),
+            "state": audio_space.get("state", ""),
+            "created_at": audio_space.get("created_at", ""),
+            "started_at": audio_space.get("started_at", ""),
+            "ended_at": audio_space.get("ended_at", ""),
+            "media_key": audio_space.get("media_key", ""),
+            "total_replay_watched": audio_space.get("total_replay_watched", 0),
+            "total_live_listeners": audio_space.get("total_live_listeners", 0),
+        }
+
+        # Host info lives one level up
+        host_results = (
+            raw.get("data", {})
+            .get("audioSpace", {})
+            .get("participants", {})
+            .get("admins", [])
         )
+        if host_results:
+            host = host_results[0].get("twitter_screen_name", "")
+            sidecar["host"] = host
 
-    print("[*] (Fallback) Fetching HLS playlist URL…")
-    hls_url = _get_hls_url(session, media_key)
-    print(f"[*] HLS URL: {hls_url}")
+        Path(metadata_path).write_text(
+            json.dumps(sidecar, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(f"[✓] Metadata saved → {metadata_path}")
+        return True
+    except Exception as exc:
+        print(f"[!] Could not save metadata: {exc}")
+        return False
+
+
+def download_via_guest_api(space_url: str, output_path: str) -> bool:
+    """
+    Fallback: resolve the HLS URL through the public guest-token API and
+    download it with ffmpeg (or yt-dlp if ffmpeg is unavailable).
+    Returns True on success.
+    """
+    space_id = extract_space_id(space_url)
+    try:
+        print("[*] (Fallback) Obtaining guest token…")
+        session = _build_guest_session()
+        print("[*] Guest token acquired.")
+
+        print("[*] (Fallback) Fetching space metadata…")
+        metadata = _get_space_metadata(session, space_id)
+        audio_space = metadata["data"]["audioSpace"]
+        media_key = audio_space["metadata"]["media_key"]
+        state = audio_space["metadata"]["state"]
+        print(f"[*] Media key  : {media_key}")
+        print(f"[*] Space state: {state}")
+
+        if state not in ("Ended", "TimedOut"):
+            print(
+                "[!] Space may still be live – replay might not be ready yet. "
+                "Re-run after the space ends if the download fails."
+            )
+
+        print("[*] (Fallback) Fetching HLS playlist URL…")
+        hls_url = _get_hls_url(session, media_key)
+        print(f"[*] HLS URL: {hls_url}")
+    except Exception as exc:
+        print(f"[!] Guest API error: {exc}")
+        return False
 
     if download_with_ffmpeg(hls_url, output_path):
         return True
@@ -288,7 +345,7 @@ def download_via_guest_api(space_url: str, output_path: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Main download orchestrator
+# Single-space download orchestrator
 # ---------------------------------------------------------------------------
 
 def download_space(
@@ -298,69 +355,121 @@ def download_space(
     transcript: bool = False,
     transcript_path: str | None = None,
     whisper_model: str = DEFAULT_WHISPER_MODEL,
-) -> None:
+    skip_if_exists: bool = False,
+    metadata: bool = False,
+    metadata_path: str | None = None,
+) -> bool:
+    """
+    Download one X Space. Returns True on success, False on failure.
+    (Does not call sys.exit — callers decide how to handle the result.)
+    """
     space_id = extract_space_id(space_url)
     print(f"[*] Space ID : {space_id}")
 
-    # --- Primary: yt-dlp (no API key required) ---
-    print("[*] Attempting download with yt-dlp…")
-    downloaded = download_with_ytdlp(space_url, output_path, cookies_file=cookies_file)
+    # --- Skip if already downloaded ---
+    if skip_if_exists and _audio_exists(output_path):
+        print(f"[~] Skipping download — file already exists: {_resolve_audio_file(output_path)}")
+    else:
+        # --- Primary: yt-dlp ---
+        print("[*] Attempting download with yt-dlp…")
+        downloaded = download_with_ytdlp(space_url, output_path, cookies_file=cookies_file)
 
-    if not downloaded:
-        # --- Fallback: public guest-token API + ffmpeg ---
-        print("[!] yt-dlp did not succeed. Trying guest-token API fallback…")
-        try:
+        if not downloaded:
+            print("[!] yt-dlp did not succeed. Trying guest-token API fallback…")
             downloaded = download_via_guest_api(space_url, output_path)
-        except Exception as exc:
-            print(f"[!] Fallback also failed: {exc}")
 
-    if not downloaded:
-        print("[✗] Download failed.")
-        sys.exit(1)
+        if not downloaded:
+            print("[✗] Download failed.")
+            return False
 
-    print("[✓] Download complete.")
+        print("[✓] Download complete.")
 
+    # --- Metadata sidecar ---
+    if metadata:
+        meta_file = metadata_path or str(Path(output_path).with_suffix(".json"))
+        save_metadata(space_id, meta_file)
+
+    # --- Transcript ---
     if transcript:
         audio_file = _resolve_audio_file(output_path)
         out_txt = transcript_path or str(Path(audio_file).with_suffix(".txt"))
-        ok = transcribe_audio(audio_file, out_txt, model_name=whisper_model)
-        if not ok:
+        if not transcribe_audio(audio_file, out_txt, model_name=whisper_model):
             print("[!] Transcription failed.")
-            sys.exit(2)
+            return False
 
-    sys.exit(0)
+    return True
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Batch helpers
+# ---------------------------------------------------------------------------
+
+def read_input_file(path: str) -> list[str]:
+    """Return non-empty, non-comment lines from a URL list file."""
+    lines = []
+    for raw in Path(path).read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#"):
+            lines.append(line)
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="downloader",
         description=(
-            "Download audio from an X (Twitter) Space. "
+            "Download audio from X (Twitter) Spaces. "
             "No paid API subscription required."
         ),
     )
-    parser.add_argument(
+
+    # --- Input ---
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
         "space",
         metavar="SPACE_URL_OR_ID",
+        nargs="?",
+        help="Full Space URL (https://x.com/i/spaces/…) or bare Space ID.",
+    )
+    input_group.add_argument(
+        "-i",
+        "--input-file",
+        metavar="FILE",
+        default=None,
         help=(
-            "Full Space URL (https://x.com/i/spaces/…) "
-            "or bare Space ID."
+            "Path to a text file containing one Space URL or ID per line. "
+            "Lines starting with '#' are treated as comments."
         ),
     )
+
+    # --- Output ---
     parser.add_argument(
         "-o",
         "--output",
         metavar="FILE",
         default=None,
         help=(
-            "Output file path (default: <space_id>.m4a). "
-            "The extension may be changed by yt-dlp."
+            "Output audio file path (default: <space_id>.m4a). "
+            "Ignored when --input-file is used; filenames are derived from Space IDs."
         ),
     )
+    parser.add_argument(
+        "-d",
+        "--output-dir",
+        metavar="DIR",
+        default=None,
+        help=(
+            "Directory to save all output files in. "
+            "Created automatically if it does not exist. "
+            "(default: current working directory)"
+        ),
+    )
+
+    # --- Auth ---
     parser.add_argument(
         "-c",
         "--cookies",
@@ -371,22 +480,44 @@ def build_parser() -> argparse.ArgumentParser:
             "browser while logged in to X. Required for members-only spaces."
         ),
     )
+
+    # --- Behaviour ---
+    parser.add_argument(
+        "--skip-if-exists",
+        action="store_true",
+        default=False,
+        help="Skip the download if the audio file already exists on disk.",
+    )
+    parser.add_argument(
+        "--metadata",
+        action="store_true",
+        default=False,
+        help=(
+            "Save a JSON sidecar file containing space title, host, state, "
+            "timestamps, and listener counts (default: <space_id>.json)."
+        ),
+    )
+
+    # --- Transcript ---
     parser.add_argument(
         "-t",
         "--transcript",
         action="store_true",
         default=False,
         help=(
-            "Generate a plain-text transcript after downloading the audio. "
+            "Generate a plain-text transcript after downloading. "
             "Uses openai-whisper locally (no API key needed). "
-            "Saved to <output>.txt by default."
+            "Saved to <audio_stem>.txt by default."
         ),
     )
     parser.add_argument(
         "--transcript-output",
         metavar="FILE",
         default=None,
-        help="Path for the transcript file (default: same stem as audio + .txt).",
+        help=(
+            "Path for the transcript file (default: same stem as audio + .txt). "
+            "Ignored when --input-file is used."
+        ),
     )
     parser.add_argument(
         "--whisper-model",
@@ -394,30 +525,72 @@ def build_parser() -> argparse.ArgumentParser:
         choices=WHISPER_MODELS,
         default=DEFAULT_WHISPER_MODEL,
         help=(
-            f"Whisper model to use for transcription. "
+            f"Whisper model size for transcription. "
             f"Choices: {', '.join(WHISPER_MODELS)}. "
-            f"Larger models are more accurate but slower and use more memory. "
+            f"Larger = more accurate but slower. "
             f"(default: {DEFAULT_WHISPER_MODEL})"
         ),
     )
     return parser
 
 
+def _output_path_for(space_id: str, output_dir: str | None) -> str:
+    filename = f"{space_id}.m4a"
+    if output_dir:
+        return str(Path(output_dir) / filename)
+    return filename
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    space_id = extract_space_id(args.space)
-    output_path = args.output or f"{space_id}.m4a"
+    # Create output directory if requested
+    if args.output_dir:
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    download_space(
-        args.space,
-        output_path,
-        cookies_file=args.cookies,
-        transcript=args.transcript,
-        transcript_path=args.transcript_output,
-        whisper_model=args.whisper_model,
-    )
+    # Build the list of (space_url, output_path) pairs
+    if args.input_file:
+        entries_raw = read_input_file(args.input_file)
+        if not entries_raw:
+            print("[!] Input file is empty or contains only comments.")
+            sys.exit(1)
+        entries = []
+        for entry in entries_raw:
+            sid = extract_space_id(entry)
+            entries.append((entry, _output_path_for(sid, args.output_dir)))
+    else:
+        space_url = args.space
+        space_id = extract_space_id(space_url)
+        output_path = args.output or _output_path_for(space_id, args.output_dir)
+        entries = [(space_url, output_path)]
+
+    # Process each space
+    failures = 0
+    for idx, (space_url, output_path) in enumerate(entries, start=1):
+        if len(entries) > 1:
+            print(f"\n[*] [{idx}/{len(entries)}] {space_url}")
+
+        success = download_space(
+            space_url=space_url,
+            output_path=output_path,
+            cookies_file=args.cookies,
+            transcript=args.transcript,
+            transcript_path=args.transcript_output if len(entries) == 1 else None,
+            whisper_model=args.whisper_model,
+            skip_if_exists=args.skip_if_exists,
+            metadata=args.metadata,
+        )
+        if not success:
+            failures += 1
+
+    if failures:
+        print(f"\n[✗] {failures}/{len(entries)} space(s) failed.")
+        sys.exit(1)
+
+    if len(entries) > 1:
+        print(f"\n[✓] All {len(entries)} spaces downloaded successfully.")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
