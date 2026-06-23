@@ -64,13 +64,17 @@ SPACE_GQL_FEATURES = {
 }
 
 
+# Space IDs are alphanumeric strings; observed lengths fall in this range.
+MIN_SPACE_ID_LENGTH = 6
+MAX_SPACE_ID_LENGTH = 30
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def extract_space_id(url_or_id: str) -> str:
     """Return the Space ID from a full URL or a bare ID string."""
-    if re.fullmatch(r"[A-Za-z0-9]{6,30}", url_or_id):
+    if re.fullmatch(rf"[A-Za-z0-9]{{{MIN_SPACE_ID_LENGTH},{MAX_SPACE_ID_LENGTH}}}", url_or_id):
         return url_or_id
     match = re.search(r"/i/spaces/([A-Za-z0-9]+)", url_or_id)
     if match:
