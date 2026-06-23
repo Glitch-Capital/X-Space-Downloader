@@ -315,7 +315,8 @@ def download_space(
             print(f"[!] Fallback also failed: {exc}")
 
     if not downloaded:
-        _finish(False, transcript_requested=transcript)
+        print("[✗] Download failed.")
+        sys.exit(1)
 
     print("[✓] Download complete.")
 
@@ -328,14 +329,6 @@ def download_space(
             sys.exit(2)
 
     sys.exit(0)
-
-
-def _finish(success: bool, transcript_requested: bool = False) -> None:
-    if success:
-        print("[✓] Download complete.")
-        sys.exit(0)
-    print("[✗] Download failed.")
-    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
