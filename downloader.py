@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 X Space Downloader
-Downloads audio from X (Twitter) Spaces.
+Downloads audio from X (Twitter) Spaces and optionally generates a transcript.
 
 No paid API required.
 
@@ -9,6 +9,7 @@ Primary method  : yt-dlp (no API key, handles auth via cookies or anonymously)
 Fallback method : Twitter guest-token API + ffmpeg
                   (uses the same public bearer token that twitter.com itself uses,
                    also free — no X API subscription needed)
+Transcription   : openai-whisper (runs locally, no API key needed)
 """
 
 import argparse
@@ -63,10 +64,14 @@ SPACE_GQL_FEATURES = {
     "rweb_tipjar_consumption_enabled": True,
 }
 
-
 # Space IDs are alphanumeric strings; observed lengths fall in this range.
 MIN_SPACE_ID_LENGTH = 6
 MAX_SPACE_ID_LENGTH = 30
+
+# Whisper model sizes (smallest → largest / most accurate).
+WHISPER_MODELS = ("tiny", "base", "small", "medium", "large")
+DEFAULT_WHISPER_MODEL = "base"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -84,6 +89,25 @@ def extract_space_id(url_or_id: str) -> str:
 
 def _bearer_header() -> dict:
     return {"Authorization": "Bearer " + BEARER_TOKEN}
+
+
+def _resolve_audio_file(output_path: str) -> str:
+    """
+    Return the path to the actual audio file on disk.
+    yt-dlp with FFmpegExtractAudio always produces an .mp3 file, so if the
+    requested extension differs we check for that first.
+    """
+    p = Path(output_path)
+    if p.exists():
+        return str(p)
+    mp3 = p.with_suffix(".mp3")
+    if mp3.exists():
+        return str(mp3)
+    # Check any audio file sharing the same stem
+    for candidate in p.parent.glob(p.stem + ".*"):
+        if candidate.suffix.lower() in {".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac"}:
+            return str(candidate)
+    return str(p)  # return original path; transcribe_audio will report the error
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +141,48 @@ def download_with_ytdlp(url: str, output_path: str, cookies_file: str | None = N
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ret = ydl.download([url])
     return ret == 0
+
+
+# ---------------------------------------------------------------------------
+# Transcription
+# ---------------------------------------------------------------------------
+
+def transcribe_audio(
+    audio_path: str,
+    transcript_path: str,
+    model_name: str = DEFAULT_WHISPER_MODEL,
+) -> bool:
+    """
+    Transcribe *audio_path* using openai-whisper and write plain text to
+    *transcript_path*. Returns True on success.
+
+    Runs entirely locally — no API key or internet connection required after
+    the Whisper model weights are downloaded on first use.
+    """
+    try:
+        import whisper  # noqa: PLC0415
+    except ImportError:
+        print(
+            "[!] openai-whisper not installed. "
+            "Run: pip install openai-whisper"
+        )
+        return False
+
+    audio_file = Path(audio_path)
+    if not audio_file.exists():
+        print(f"[!] Audio file not found for transcription: {audio_path}")
+        return False
+
+    print(f"[*] Loading Whisper model '{model_name}'…")
+    model = whisper.load_model(model_name)
+
+    print(f"[*] Transcribing {audio_path} …")
+    result = model.transcribe(str(audio_file))
+    text: str = result.get("text", "").strip()
+
+    Path(transcript_path).write_text(text, encoding="utf-8")
+    print(f"[✓] Transcript saved → {transcript_path}")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -225,27 +291,46 @@ def download_via_guest_api(space_url: str, output_path: str) -> bool:
 # Main download orchestrator
 # ---------------------------------------------------------------------------
 
-def download_space(space_url: str, output_path: str, cookies_file: str | None = None) -> None:
+def download_space(
+    space_url: str,
+    output_path: str,
+    cookies_file: str | None = None,
+    transcript: bool = False,
+    transcript_path: str | None = None,
+    whisper_model: str = DEFAULT_WHISPER_MODEL,
+) -> None:
     space_id = extract_space_id(space_url)
     print(f"[*] Space ID : {space_id}")
 
     # --- Primary: yt-dlp (no API key required) ---
     print("[*] Attempting download with yt-dlp…")
-    if download_with_ytdlp(space_url, output_path, cookies_file=cookies_file):
-        _finish(True)
+    downloaded = download_with_ytdlp(space_url, output_path, cookies_file=cookies_file)
 
-    # --- Fallback: public guest-token API + ffmpeg ---
-    print("[!] yt-dlp did not succeed. Trying guest-token API fallback…")
-    try:
-        if download_via_guest_api(space_url, output_path):
-            _finish(True)
-    except Exception as exc:
-        print(f"[!] Fallback also failed: {exc}")
+    if not downloaded:
+        # --- Fallback: public guest-token API + ffmpeg ---
+        print("[!] yt-dlp did not succeed. Trying guest-token API fallback…")
+        try:
+            downloaded = download_via_guest_api(space_url, output_path)
+        except Exception as exc:
+            print(f"[!] Fallback also failed: {exc}")
 
-    _finish(False)
+    if not downloaded:
+        _finish(False, transcript_requested=transcript)
+
+    print("[✓] Download complete.")
+
+    if transcript:
+        audio_file = _resolve_audio_file(output_path)
+        out_txt = transcript_path or str(Path(audio_file).with_suffix(".txt"))
+        ok = transcribe_audio(audio_file, out_txt, model_name=whisper_model)
+        if not ok:
+            print("[!] Transcription failed.")
+            sys.exit(2)
+
+    sys.exit(0)
 
 
-def _finish(success: bool) -> None:
+def _finish(success: bool, transcript_requested: bool = False) -> None:
     if success:
         print("[✓] Download complete.")
         sys.exit(0)
@@ -293,6 +378,35 @@ def build_parser() -> argparse.ArgumentParser:
             "browser while logged in to X. Required for members-only spaces."
         ),
     )
+    parser.add_argument(
+        "-t",
+        "--transcript",
+        action="store_true",
+        default=False,
+        help=(
+            "Generate a plain-text transcript after downloading the audio. "
+            "Uses openai-whisper locally (no API key needed). "
+            "Saved to <output>.txt by default."
+        ),
+    )
+    parser.add_argument(
+        "--transcript-output",
+        metavar="FILE",
+        default=None,
+        help="Path for the transcript file (default: same stem as audio + .txt).",
+    )
+    parser.add_argument(
+        "--whisper-model",
+        metavar="MODEL",
+        choices=WHISPER_MODELS,
+        default=DEFAULT_WHISPER_MODEL,
+        help=(
+            f"Whisper model to use for transcription. "
+            f"Choices: {', '.join(WHISPER_MODELS)}. "
+            f"Larger models are more accurate but slower and use more memory. "
+            f"(default: {DEFAULT_WHISPER_MODEL})"
+        ),
+    )
     return parser
 
 
@@ -303,7 +417,14 @@ def main() -> None:
     space_id = extract_space_id(args.space)
     output_path = args.output or f"{space_id}.m4a"
 
-    download_space(args.space, output_path, cookies_file=args.cookies)
+    download_space(
+        args.space,
+        output_path,
+        cookies_file=args.cookies,
+        transcript=args.transcript,
+        transcript_path=args.transcript_output,
+        whisper_model=args.whisper_model,
+    )
 
 
 if __name__ == "__main__":
