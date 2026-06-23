@@ -60,6 +60,19 @@ https://x.com/i/spaces/1OyKAVnmZbIKb
 python downloader.py -i spaces.txt -d ~/spaces/
 ```
 
+### Download all spaces from a user
+
+```bash
+# Download every recorded Space from @someuser
+python downloader.py --user someuser -d ~/spaces/
+
+# The @ prefix is optional
+python downloader.py -u @someuser -d ~/spaces/
+
+# Combine with transcripts and skip already-downloaded files
+python downloader.py -u someuser -d ~/spaces/ -t --skip-if-exists
+```
+
 ### Transcript
 
 ```bash
@@ -101,6 +114,7 @@ python downloader.py https://x.com/i/spaces/1eaKbrBlPlbKX -c cookies.txt
 |---|---|
 | `SPACE_URL_OR_ID` | Full `https://x.com/i/spaces/…` URL or bare Space ID |
 | `-i / --input-file FILE` | Text file of URLs/IDs (one per line) for batch downloads |
+| `-u / --user USERNAME` | Download all recorded Spaces from this X username (`@` prefix optional) |
 | `-o / --output FILE` | Output audio file path (single-space mode only; default: `<space_id>.m4a`) |
 | `-d / --output-dir DIR` | Directory to save all output files (created if missing) |
 | `-c / --cookies FILE` | Netscape `cookies.txt` for members-only spaces |

@@ -47,6 +47,24 @@ AUDIO_SPACE_BY_ID_URL = (
 LIVE_VIDEO_STREAM_URL = (
     "https://twitter.com/i/api/1.1/live_video_stream/status/{media_key}"
 )
+USER_BY_SCREEN_NAME_URL = (
+    "https://twitter.com/i/api/graphql/"
+    "oUZZZ8Oddwxs8Cd3iW3UEA/UserByScreenName"
+)
+SPACES_BY_CREATOR_URL = (
+    "https://twitter.com/i/api/graphql/"
+    "oCOFbBbYFiW6LHqjGfHmxA/AudioSpacesByCreatorId"
+)
+
+USER_LOOKUP_FEATURES = {
+    "hidden_profile_likes_enabled": True,
+    "hidden_profile_subscriptions_enabled": True,
+    "responsive_web_graphql_exclude_directive_enabled": True,
+    "verified_phone_label_enabled": False,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+}
 
 SPACE_GQL_VARIABLES = {
     "isMetatagsQuery": False,
@@ -260,6 +278,110 @@ def _build_guest_session() -> requests.Session:
     return session
 
 
+def _get_user_id(session: requests.Session, username: str) -> str:
+    """Resolve a screen name to its numeric REST user ID."""
+    variables = {"screen_name": username, "withSafetyModeUserFields": True}
+    params = {
+        "variables": json.dumps(variables),
+        "features": json.dumps(USER_LOOKUP_FEATURES),
+    }
+    resp = session.get(USER_BY_SCREEN_NAME_URL, params=params)
+    resp.raise_for_status()
+    return resp.json()["data"]["user"]["result"]["rest_id"]
+
+
+def _list_spaces_by_creator(session: requests.Session, user_id: str) -> list[str]:
+    """Return Space IDs for the given creator user ID via the GraphQL API."""
+    variables = {"creatorIds": [user_id], "isFromVault": False, "limit": 20}
+    params = {
+        "variables": json.dumps(variables),
+        "features": json.dumps(SPACE_GQL_FEATURES),
+    }
+    resp = session.get(SPACES_BY_CREATOR_URL, params=params)
+    resp.raise_for_status()
+    data = resp.json()
+
+    space_ids: list[str] = []
+    spaces = data.get("data", {}).get("audioSpacesByCreatorId", [])
+    for space in spaces:
+        sid = (
+            space.get("metadata", {}).get("rest_id")
+            or space.get("rest_id")
+        )
+        if sid:
+            space_ids.append(sid)
+    return space_ids
+
+
+def _list_spaces_via_ytdlp(
+    username: str,
+    cookies_file: str | None = None,
+) -> list[str]:
+    """Try to list a user's spaces via yt-dlp flat-playlist extraction."""
+    try:
+        import yt_dlp  # noqa: PLC0415
+    except ImportError:
+        return []
+
+    profile_url = f"https://x.com/{username}/spaces"
+    opts: dict = {
+        "extract_flat": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+    if cookies_file:
+        opts["cookiefile"] = cookies_file
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(profile_url, download=False)
+        if not info:
+            return []
+        urls: list[str] = []
+        for entry in info.get("entries") or []:
+            entry_url = entry.get("webpage_url") or entry.get("url", "")
+            if "/i/spaces/" in entry_url:
+                urls.append(entry_url)
+        return urls
+    except Exception:
+        return []
+
+
+def fetch_user_spaces(
+    username: str,
+    cookies_file: str | None = None,
+) -> list[str]:
+    """
+    Return a list of Space URLs recorded by *username*.
+
+    Tries yt-dlp flat-playlist extraction first; falls back to the
+    guest-token GraphQL API (``AudioSpacesByCreatorId``).
+    """
+    # Primary: yt-dlp
+    urls = _list_spaces_via_ytdlp(username, cookies_file)
+    if urls:
+        print(f"[✓] Found {len(urls)} space(s) via yt-dlp for @{username}.")
+        return urls
+
+    # Fallback: guest-token GraphQL
+    print("[*] yt-dlp did not return spaces; trying guest-token API…")
+    try:
+        session = _build_guest_session()
+        print(f"[*] Resolving user ID for @{username}…")
+        user_id = _get_user_id(session, username)
+        print(f"[*] User ID: {user_id}")
+        space_ids = _list_spaces_by_creator(session, user_id)
+        if not space_ids:
+            print(f"[!] No recorded spaces found for @{username}.")
+            return []
+        urls = [f"https://x.com/i/spaces/{sid}" for sid in space_ids]
+        print(f"[✓] Found {len(urls)} space(s) for @{username}.")
+        return urls
+    except Exception as exc:
+        print(f"[!] Could not fetch spaces for @{username}: {exc}")
+        return []
+
+
 def save_metadata(space_id: str, metadata_path: str) -> bool:
     """
     Fetch space metadata via the guest-token API and write a JSON sidecar to
@@ -445,6 +567,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Lines starting with '#' are treated as comments."
         ),
     )
+    input_group.add_argument(
+        "-u",
+        "--user",
+        metavar="USERNAME",
+        default=None,
+        help=(
+            "Download all recorded Spaces from this X username "
+            "(the @ prefix is optional, e.g. elonmusk or @elonmusk)."
+        ),
+    )
 
     # --- Output ---
     parser.add_argument(
@@ -559,6 +691,16 @@ def main() -> None:
         for entry in entries_raw:
             sid = extract_space_id(entry)
             entries.append((entry, _output_path_for(sid, args.output_dir)))
+    elif args.user:
+        username = args.user.lstrip("@")
+        print(f"[*] Fetching recorded spaces for @{username}…")
+        space_urls = fetch_user_spaces(username, cookies_file=args.cookies)
+        if not space_urls:
+            sys.exit(1)
+        entries = []
+        for url in space_urls:
+            sid = extract_space_id(url)
+            entries.append((url, _output_path_for(sid, args.output_dir)))
     else:
         space_url = args.space
         space_id = extract_space_id(space_url)
