@@ -1,16 +1,18 @@
-# X-Space-Downloader
+# X Space Downloader
 
-Downloads audio from X (Twitter) Spaces as MP3, with optional transcription and metadata.  
-**No paid X API subscription required.**
+Download audio from X (Twitter) Spaces — no paid API, no developer account required.
+
+- Saves audio as MP3
+- Optional local transcription via [OpenAI Whisper](https://github.com/openai/whisper) (no API key)
+- Optional JSON metadata sidecar (title, host, timestamps, listener counts)
+- Single space, batch file, or grab everything from a user
 
 ---
 
 ## Requirements
 
-| Tool | Purpose |
-|---|---|
-| Python 3.10+ | Runtime |
-| [ffmpeg](https://ffmpeg.org/download.html) | Audio muxing (needed by yt-dlp's audio extractor and Whisper) |
+- **Python 3.10+**
+- **[ffmpeg](https://ffmpeg.org/download.html)** — required for audio extraction
 
 ---
 
@@ -20,7 +22,7 @@ Downloads audio from X (Twitter) Spaces as MP3, with optional transcription and 
 pip install -r requirements.txt
 ```
 
-> **Note:** `openai-whisper` pulls in PyTorch (~1–2 GB). If you don't need transcription:
+> `openai-whisper` pulls in PyTorch (~1–2 GB). If you don't need transcription, install only what's required:
 > ```bash
 > pip install yt-dlp requests
 > ```
@@ -32,22 +34,32 @@ pip install -r requirements.txt
 ### Single space
 
 ```bash
-# Full URL
+# By URL
 python downloader.py https://x.com/i/spaces/1eaKbrBlPlbKX
 
-# Bare Space ID
+# By bare Space ID
 python downloader.py 1eaKbrBlPlbKX
 
-# Custom output file
+# Custom output file or directory
 python downloader.py https://x.com/i/spaces/1eaKbrBlPlbKX -o my_space.mp3
-
-# Save to a specific directory
 python downloader.py https://x.com/i/spaces/1eaKbrBlPlbKX -d ~/spaces/
 ```
 
-### Batch download
+### All spaces from a user
 
-Create a file with one Space URL or ID per line (lines starting with `#` are ignored):
+```bash
+python downloader.py --user someuser -d ~/spaces/
+
+# @ prefix is optional
+python downloader.py -u @someuser -d ~/spaces/
+
+# With transcripts, skip anything already downloaded
+python downloader.py -u someuser -d ~/spaces/ -t --skip-if-exists
+```
+
+### Batch download from a file
+
+One URL or Space ID per line; lines starting with `#` are ignored.
 
 ```text
 # spaces.txt
@@ -60,47 +72,41 @@ https://x.com/i/spaces/1OyKAVnmZbIKb
 python downloader.py -i spaces.txt -d ~/spaces/
 ```
 
-### Download all spaces from a user
+### Transcription
+
+Runs [OpenAI Whisper](https://github.com/openai/whisper) locally. Model weights download automatically on first use.
 
 ```bash
-# Download every recorded Space from @someuser
-python downloader.py --user someuser -d ~/spaces/
-
-# The @ prefix is optional
-python downloader.py -u @someuser -d ~/spaces/
-
-# Combine with transcripts and skip already-downloaded files
-python downloader.py -u someuser -d ~/spaces/ -t --skip-if-exists
-```
-
-### Transcript
-
-```bash
-# Generate a .txt transcript alongside the audio
+# Transcript saved alongside the audio as <space_id>.txt
 python downloader.py https://x.com/i/spaces/1eaKbrBlPlbKX -t
 
-# Custom transcript path
+# Custom output path
 python downloader.py https://x.com/i/spaces/1eaKbrBlPlbKX -t --transcript-output notes.txt
 
-# More accurate model (slower)
+# Higher accuracy (slower)
 python downloader.py https://x.com/i/spaces/1eaKbrBlPlbKX -t --whisper-model medium
 ```
 
-### Metadata sidecar
+| Model | Size | Speed | Accuracy |
+|---|---|---|---|
+| `tiny` | 75 MB | Fastest | Lowest |
+| `base` | 145 MB | Fast | Good *(default)* |
+| `small` | 465 MB | Moderate | Better |
+| `medium` | 1.5 GB | Slow | High |
+| `large` | 3 GB | Slowest | Best |
+
+### Metadata
+
+Saves a JSON sidecar with the space title, host, state, timestamps, and listener counts.
 
 ```bash
-# Saves <space_id>.json with title, host, state, timestamps, listener counts
 python downloader.py https://x.com/i/spaces/1eaKbrBlPlbKX --metadata
-```
-
-### Skip already-downloaded spaces
-
-```bash
-# Useful for re-running a batch without re-downloading completed entries
-python downloader.py -i spaces.txt -d ~/spaces/ --skip-if-exists
+# → <space_id>.json
 ```
 
 ### Members-only spaces
+
+Export your cookies from a browser while logged in to X using [Get cookies.txt LOCALLY](https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) (Chrome) or [Export Cookies](https://addons.mozilla.org/en-US/firefox/addon/export-cookies-txt/) (Firefox), then pass the file:
 
 ```bash
 python downloader.py https://x.com/i/spaces/1eaKbrBlPlbKX -c cookies.txt
@@ -112,43 +118,24 @@ python downloader.py https://x.com/i/spaces/1eaKbrBlPlbKX -c cookies.txt
 
 | Flag | Description |
 |---|---|
-| `SPACE_URL_OR_ID` | Full `https://x.com/i/spaces/…` URL or bare Space ID |
-| `-i / --input-file FILE` | Text file of URLs/IDs (one per line) for batch downloads |
-| `-u / --user USERNAME` | Download all recorded Spaces from this X username (`@` prefix optional) |
-| `-o / --output FILE` | Output audio file path (single-space mode only; default: `<space_id>.m4a`) |
-| `-d / --output-dir DIR` | Directory to save all output files (created if missing) |
+| `SPACE_URL_OR_ID` | Space URL or bare Space ID |
+| `-u / --user USERNAME` | Download all recorded Spaces from a user (`@` prefix optional) |
+| `-i / --input-file FILE` | Text file of URLs/IDs, one per line |
+| `-o / --output FILE` | Output file path (single-space only; default: `<space_id>.m4a`) |
+| `-d / --output-dir DIR` | Directory for all output files (created if missing) |
 | `-c / --cookies FILE` | Netscape `cookies.txt` for members-only spaces |
-| `--skip-if-exists` | Skip download if audio file already exists on disk |
-| `--metadata` | Save a JSON sidecar with space info (`<space_id>.json`) |
-| `-t / --transcript` | Generate a plain-text transcript after downloading |
-| `--transcript-output FILE` | Transcript file path (single-space mode only; default: `<audio_stem>.txt`) |
-| `--whisper-model MODEL` | Whisper model: `tiny`, `base` *(default)*, `small`, `medium`, `large` |
-
-### Whisper model comparison
-
-| Model | ~Size | Speed | Accuracy |
-|---|---|---|---|
-| `tiny` | 75 MB | Fastest | Lowest |
-| `base` | 145 MB | Fast | Good *(default)* |
-| `small` | 465 MB | Moderate | Better |
-| `medium` | 1.5 GB | Slow | High |
-| `large` | 3 GB | Slowest | Best |
-
-Model weights download automatically on first use.
-
----
-
-### Exporting cookies
-
-If a space requires login, export your cookies while logged in to X using a browser extension such as [Get cookies.txt LOCALLY](https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) (Chrome) or [Export Cookies](https://addons.mozilla.org/en-US/firefox/addon/export-cookies-txt/) (Firefox), then pass the file with `-c cookies.txt`.
+| `--skip-if-exists` | Skip if the audio file already exists |
+| `--metadata` | Save a JSON sidecar (`<space_id>.json`) |
+| `-t / --transcript` | Generate a `.txt` transcript after downloading |
+| `--transcript-output FILE` | Transcript path (single-space only; default: `<audio_stem>.txt`) |
+| `--whisper-model MODEL` | `tiny`, `base` *(default)*, `small`, `medium`, `large` |
 
 ---
 
 ## How it works
 
-1. **Primary** — passes the Space URL to [yt-dlp](https://github.com/yt-dlp/yt-dlp), which handles authentication, HLS resolution, and audio extraction. No API key needed.
-2. **Fallback** — if yt-dlp fails, the script resolves the HLS playlist using Twitter's own public guest-token endpoint, then downloads with ffmpeg.
-3. **Transcription** *(optional, `-t`)* — runs [OpenAI Whisper](https://github.com/openai/whisper) locally on the downloaded audio. No API key or internet connection required after model weights are downloaded.
-4. **Metadata** *(optional, `--metadata`)* — fetches the space title, host, state, timestamps, and listener counts via the public guest-token API and writes them to a JSON sidecar.
+1. **yt-dlp** — the Space URL is passed directly to [yt-dlp](https://github.com/yt-dlp/yt-dlp), which resolves the HLS stream and extracts audio. No API key needed.
+2. **Fallback** — if yt-dlp fails, the script uses Twitter's own public guest-token endpoint to resolve the HLS playlist and downloads it with ffmpeg.
+3. **Transcription** — [OpenAI Whisper](https://github.com/openai/whisper) runs locally on the downloaded audio. No API key or internet connection required after the model weights are downloaded.
 
-All methods are completely free and require no X Developer account.
+Everything is free and works without an X Developer account.
